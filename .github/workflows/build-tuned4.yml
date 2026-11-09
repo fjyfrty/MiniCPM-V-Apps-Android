@@ -1,0 +1,77 @@
+name: Build Tuned APK v4
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Android toolchain
+        run: sdkmanager 'platforms;android-36.1' 'build-tools;36.0.0' 'ndk;27.0.12077973' 'cmake;4.1.2'
+      - name: Apply CPU LES patch
+        run: |
+          git -C llama.cpp-omni apply --check ../patches/android-cpu-les.patch
+          git -C llama.cpp-omni apply ../patches/android-cpu-les.patch
+          echo patch-applied
+      - name: Vendor KleidiAI source
+        run: |
+          git clone --depth 1 --branch v1.24.0 https://github.com/ARM-software/kleidiai.git kleidiai-src
+          ls kleidiai-src | head -5
+      - name: Tune LES and point both CMake configs at local KleidiAI
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          j = pathlib.Path('MiniCPM-V-demo-Android/app/src/main/cpp/llama_jni.cpp')
+          s = j.read_text()
+          s = s.replace('N_THREADS               = 4;', 'N_THREADS               = 8;', 1)
+          s = s.replace('LLAMA_MOE_IO_THREADS', 'LLAMA_MOE_IO_THREADS', 1)
+          s = s.replace('setenv("LLAMA_MOE_IO_THREADS", "4", 1);', 'setenv("LLAMA_MOE_IO_THREADS", "8", 1);', 1)
+          j.write_text(s)
+          k = pathlib.Path('MiniCPM-V-demo-Android/app/src/main/java/com/example/minicpm_v_demo/LlamaEngine.kt')
+          t = k.read_text()
+          t = t.replace('else -> 16', 'else -> 32', 1)
+          k.write_text(t)
+          g = pathlib.Path('MiniCPM-V-demo-Android/app/build.gradle.kts')
+          b = g.read_text()
+          a1 = 'arguments += "-DLLAMA_CURL=OFF"'
+          i1 = a1 + '\n                arguments += "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI_DOWNLOAD=" + rootProject.projectDir.parentFile.resolve("kleidiai-src").absolutePath'
+          b = b.replace(a1, i1, 1)
+          a2 = '            "-S", file("src/main/cpp").absolutePath,'
+          i2 = '            "-DFETCHCONTENT_SOURCE_DIR_KLEIDIAI_DOWNLOAD=" + project.rootProject.projectDir.parentFile.resolve("kleidiai-src").absolutePath,\n' + a2
+          b = b.replace(a2, i2, 1)
+          g.write_text(b)
+          assert 'N_THREADS               = 8;' in j.read_text(), 'threads'
+          assert 'setenv("LLAMA_MOE_IO_THREADS", "8", 1);' in j.read_text(), 'io'
+          assert 'else -> 32' in k.read_text(), 'window'
+          assert g.read_text().count('FETCHCONTENT_SOURCE_DIR_KLEIDIAI_DOWNLOAD') == 2, 'fetchcontent x2'
+          print('all edits applied')
+          PY
+      - name: Build debug APK
+        working-directory: MiniCPM-V-demo-Android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --max-workers=2
+      - name: Collect APK
+        run: |
+          mkdir -p dist
+          cp MiniCPM-V-demo-Android/app/build/outputs/apk/debug/app-debug.apk dist/
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-tuned4
+          path: dist/
+          if-no-files-found: error
